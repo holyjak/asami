@@ -66,7 +66,7 @@
         (if (contains-updates? obj)
           (do
             (when-not (or id ident ident2)
-              (throw (ex-info "Nodes to be updated must be identified with :db/id or :db/ident" obj)))
+              (throw (ex-info "Nodes to be updated must be identified with :db/id, :db/ident, or :id" obj)))
             (let [node-ref (cond
                              id (and (seq (gr/resolve-triple graph id '?a '?v)) id)
                              ident (ffirst (gr/resolve-triple graph '?r :db/ident ident))
@@ -141,8 +141,17 @@
   (and (number? i) (neg? i)))
 
 (defn resolve-lookup-refs [graph i]
-  (or (and (writer/lookup-ref? i)
-           (ffirst (gr/resolve-triple graph '?r (first i) (second i))))
+  (when (writer/lookup-ref? i)
+    (ffirst (gr/resolve-triple graph '?r (first i) (second i)))))
+
+(defn- resolve-if-lookup-ref
+  "If `i` is a lookup-ref such as `[:id \"myid\"]` then look it up in existing entities (via `graph`) or
+  the entities currently being created (via the `id-map`). Otherwise return i as-is."
+  [graph id-map i]
+  (or (when (writer/lookup-ref? i)
+        (or (resolve-lookup-refs graph i)
+            ;; lookup-ref is e.g. `[:id "myid"]`; only the value is used in id mapping
+            (get id-map (second i))))
       i))
 
 (s/defn build-triples :- [(s/one [Triple] "Data to be asserted")
@@ -157,8 +166,7 @@
     data :- [s/Any]
     limit :- (s/maybe s/Num)]
    (let [[retract-stmts new-data] (util/divide' #(= :db/retract (first %)) data)
-         ref->id (partial resolve-lookup-refs graph)
-         retractions (mapv (comp (partial mapv ref->id) rest) retract-stmts)
+         retractions (mapv (comp (partial mapv (partial resolve-if-lookup-ref graph nil)) rest) retract-stmts)
          add-triples (fn [[acc racc ids top-ids :as last-result] obj]
                        (if (and limit (> (count acc) limit))
                          (reduced last-result)
@@ -182,10 +190,11 @@
                                (when-let [ref (and (writer/lookup-ref? (nth obj 1))
                                                    (= (first (nth obj 1)) (nth obj 2))
                                                    (nth obj 1))]
+                                 ;; NOTE: Use (binding [writer/*id-map* (volatile! ids)] (writer/get-ref id) ???
                                  (let [new-id (or #_(ids ref) (node/new-node graph))] ; I cannot see where `(ids ref)` would be non-nil in any well-formed tx
                                    [(conj acc (assoc (vec-rest obj) 0 new-id))
                                     racc
-                                    (assoc ids ref new-id)
+                                    (assoc ids (second ref) new-id)
                                     top-ids]))
                                ;; Ex.: [:db/add -1 :db/id -1]
                                (when (= (nth obj 2) :db/id)
@@ -196,7 +205,7 @@
                                        racc
                                        (assoc ids (or id new-id) new-id)
                                        top-ids]))))
-                              (let [triple (mapv #(or (ids %) (ref->id %)) (rest obj))]
+                              (let [triple (mapv #(or (ids %) (resolve-if-lookup-ref graph ids %)) (rest obj))]
                                 [(conj acc triple) racc ids top-ids]))
                              (throw (ex-info (str "Bad data in transaction: " obj) {:data obj}))))))
          [triples rtriples id-map top-level-ids] (reduce add-triples [[] retractions {} #{}] new-data)
